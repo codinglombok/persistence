@@ -13,7 +13,7 @@ composer require lombokclarion/persistence
 
 ## Namespace
 
-```
+```php
 LombokClarion\Persistence
 ```
 
