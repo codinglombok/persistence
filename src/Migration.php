@@ -14,7 +14,7 @@ interface Migration
      * Override to return false only for DDL that genuinely supports
      * transactions on the active driver. Defaults to
      * SchemaBuilder::migrationsAreTransactionalByDefault() (false on MySQL,
-     * true elsewhere) per master prompt §7.
+     * true elsewhere) per design spec §7.
      */
     public function runsInTransaction(SchemaBuilder $schema): bool;
 }

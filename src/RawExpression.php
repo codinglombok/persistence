@@ -10,7 +10,7 @@ use LombokClarion\Persistence\Exceptions\QueryException;
  * The ONLY raw-SQL escape hatch in the QueryBuilder. It still requires
  * bound placeholders — there is no way to hand it a pre-concatenated
  * string containing a value. The number of `?` placeholders in $sql MUST
- * match count($bindings) or construction fails immediately (master prompt
+ * match count($bindings) or construction fails immediately (design spec
  * §7: "it cannot accept concatenated values").
  */
 final class RawExpression

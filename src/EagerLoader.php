@@ -31,8 +31,19 @@ use PDO;
  */
 final class EagerLoader
 {
-    public function __construct(private readonly PDO $pdo)
+    private readonly Grammar $grammar;
+
+    /**
+     * $grammar: same default and same reason as QueryBuilder — ANSI unless
+     * told otherwise. A caller on a mysql connection must pass its grammar
+     * through, or eager-loaded relations would silently generate ANSI SQL
+     * while the parent query generated backticks. That split-brain is the
+     * kind of bug the seam exists to prevent, so the loader takes the
+     * grammar rather than assuming it (AUDIT-TRAIL #39).
+     */
+    public function __construct(private readonly PDO $pdo, ?Grammar $grammar = null)
     {
+        $this->grammar = $grammar ?? new AnsiGrammar();
     }
 
     /**
@@ -85,7 +96,7 @@ final class EagerLoader
             return $parentRows;
         }
 
-        $related = (new QueryBuilder($this->pdo, $relation->relatedTable))
+        $related = (new QueryBuilder($this->pdo, $relation->relatedTable, $this->grammar))
             ->where($relation->foreignKey, 'in', $parentKeys)
             ->get();
 
@@ -121,7 +132,7 @@ final class EagerLoader
             return $parentRows;
         }
 
-        $related = (new QueryBuilder($this->pdo, $relation->relatedTable))
+        $related = (new QueryBuilder($this->pdo, $relation->relatedTable, $this->grammar))
             ->where($relation->localKey, 'in', array_values($foreignKeys))
             ->get();
 

@@ -2,7 +2,7 @@
     "name": "lombokclarion/persistence",
     "description": "QueryBuilder (bound parameters only), SchemaBuilder, and an explicit-manifest MigrationRunner for LombokClarion.",
     "type": "library",
-    "license": "MIT",
+    "license": "Apache-2.0",
     "require": {
         "php": ">=8.3",
         "ext-pdo": "*"
@@ -10,6 +10,11 @@
     "autoload": {
         "psr-4": {
             "LombokClarion\\Persistence\\": "src/"
+        }
+    },
+    "extra": {
+        "branch-alias": {
+            "dev-main": "2.2.x-dev"
         }
     }
 }

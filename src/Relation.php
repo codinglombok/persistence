@@ -7,7 +7,7 @@ namespace LombokClarion\Persistence;
 /**
  * Declares how a "parent" table relates to a "child" table, used by
  * EagerLoader to batch-load related rows in one query instead of N+1
- * lazy queries inside a view loop (master prompt §7).
+ * lazy queries inside a view loop (design spec §7).
  *
  * Relation definitions are registered explicitly in the repository
  * (not discovered via annotations or conventions), consistent with

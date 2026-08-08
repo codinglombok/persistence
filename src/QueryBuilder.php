@@ -34,11 +34,41 @@ final class QueryBuilder
     /** @var list<string> relations requested for eager loading (see Repository::with()) */
     private array $eagerLoad = [];
 
+    private readonly Grammar $grammar;
+
+    /**
+     * $grammar defaults to ANSI — double-quoted identifiers, which is what
+     * every call site got before Stage 10 and what pgsql and sqlite want.
+     * Passing MySqlGrammar (or letting ConnectionManager::table() pass the
+     * one matching the connection's driver) is the only thing that changes
+     * the generated SQL. Nothing about VALUES changes: they were bound
+     * parameters before this seam existed and they still are.
+     */
     public function __construct(
         private readonly PDO $pdo,
         private readonly string $table,
+        ?Grammar $grammar = null,
     ) {
+        $this->grammar = $grammar ?? new AnsiGrammar();
         Identifier::validate($table);
+    }
+
+    public function grammar(): Grammar
+    {
+        return $this->grammar;
+    }
+
+    /**
+     * The SELECT this builder would run, without running it. Exists so that
+     * driver-specific SQL generation is testable against a driver we do not
+     * have a server for — the grammar is a pure string concern, and proving
+     * it should not require booting MySQL.
+     *
+     * @return array{0: string, 1: list<mixed>}
+     */
+    public function toSql(): array
+    {
+        return $this->buildSelect();
     }
 
     public function select(string ...$columns): self
@@ -77,6 +107,31 @@ final class QueryBuilder
 
         $clone->wheres[] = $this->qualifyColumn($column) . ' ' . ($operator === '!=' ? '!=' : strtoupper($operator)) . ' ?';
         $clone->bindings = [...$this->bindings, $value];
+        return $clone;
+    }
+
+    /**
+     * WHERE column IS NULL — finding #46, surfaced by the first consumer
+     * app (SIGAP-MP): soft-delete filtering needs IS NULL, and no bound
+     * parameter can say it (`= NULL` is always false in SQL). A dedicated
+     * method instead of admitting 'is' into where()'s operator list,
+     * because where() promises "the value is a bound parameter" and an
+     * operator whose only valid value is the non-value NULL would be the
+     * one row of the table where that promise silently means nothing.
+     */
+    public function whereNull(string $column): self
+    {
+        $clone = clone $this;
+        $clone->wheres[] = $this->qualifyColumn($column) . ' IS NULL';
+
+        return $clone;
+    }
+
+    public function whereNotNull(string $column): self
+    {
+        $clone = clone $this;
+        $clone->wheres[] = $this->qualifyColumn($column) . ' IS NOT NULL';
+
         return $clone;
     }
 
@@ -127,10 +182,10 @@ final class QueryBuilder
     {
         if (str_contains($ref, '.')) {
             [$tbl, $col] = explode('.', $ref, 2);
-            return Identifier::quote(Identifier::validate($tbl)) . '.' . Identifier::quote(Identifier::validate($col));
+            return $this->grammar->quoteIdentifier($tbl) . '.' . $this->grammar->quoteIdentifier($col);
         }
 
-        return Identifier::quote(Identifier::validate($ref));
+        return $this->grammar->quoteIdentifier($ref);
     }
 
     public function groupBy(string $column): self
@@ -170,9 +225,9 @@ final class QueryBuilder
     /**
      * Explicit eager-loading declaration. Repository implementations read
      * this list and issue one extra bound query per relation instead of
-     * letting a view/loop trigger N+1 lazy queries (master prompt §7).
+     * letting a view/loop trigger N+1 lazy queries (design spec §7).
      *
-     * @param list<string> $relations
+     * @param string ...$relations
      */
     public function with(string ...$relations): self
     {
@@ -214,6 +269,80 @@ final class QueryBuilder
     }
 
     /**
+     * Typed aggregate without opening the raw-string door (U-S1-5):
+     * `SELECT <col>, COUNT(*) ... GROUP BY <col>` with the column going
+     * through the same identifier validation as everywhere else. Returns
+     * value => count. Exists so a consumer counting rows per status does not
+     * have to fetch every row and aggregate in PHP — or worse, reach for
+     * `$pdo->query("SELECT COUNT(*) ...")` outside the audited path once the
+     * data grows.
+     *
+     * @return array<string, int>
+     */
+    public function countBy(string $column): array
+    {
+        [$sql, $bindings] = $this->buildSelect(countOnly: true, countByColumn: $column);
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($bindings);
+        $result = [];
+        /** @var array{0: string|int|null, 1: int|string} $row */
+        foreach ($stmt->fetchAll(PDO::FETCH_NUM) as $row) {
+            $result[(string) $row[0]] = (int) $row[1];
+        }
+        return $result;
+    }
+
+    /**
+     * One page of results plus the metadata a client needs to render paging
+     * controls, in one call:
+     *
+     *   ['data' => list<row>,
+     *    'meta' => ['page' => int, 'per_page' => int, 'total' => int,
+     *               'last_page' => int, 'from' => int|null, 'to' => int|null]]
+     *
+     * Two queries — a COUNT and the page SELECT — sharing the same wheres
+     * and joins, so they cannot disagree about which rows are being paged.
+     * `total` is the count BEFORE limit/offset; any limit()/offset() already
+     * on the builder is overridden by the page arithmetic, because a paginated
+     * query has exactly one correct limit and it is per_page.
+     *
+     * `page` is clamped to >= 1 rather than throwing: the typical source is a
+     * `?page=` query param, and `?page=0` or `?page=-3` from a hand-edited URL
+     * is a request for the first page, not a 500. `per_page` throwing instead
+     * of clamping is deliberate too — its source is the CODE, not the user,
+     * and per_page <= 0 is a bug to surface, not input to tolerate.
+     *
+     * @return array{data: list<array<string, mixed>>, meta: array{page: int, per_page: int, total: int, last_page: int, from: int|null, to: int|null}}
+     */
+    public function paginate(int $page = 1, int $perPage = 15): array
+    {
+        if ($perPage < 1) {
+            throw new QueryException("paginate() per_page must be >= 1, got $perPage.");
+        }
+
+        $page = max(1, $page);
+        $total = $this->count();
+        $lastPage = max(1, (int) ceil($total / $perPage));
+
+        $rows = $this->limit($perPage)->offset(($page - 1) * $perPage)->get();
+
+        $from = $rows === [] ? null : (($page - 1) * $perPage) + 1;
+        $to = $rows === [] ? null : (($page - 1) * $perPage) + count($rows);
+
+        return [
+            'data' => $rows,
+            'meta' => [
+                'page' => $page,
+                'per_page' => $perPage,
+                'total' => $total,
+                'last_page' => $lastPage,
+                'from' => $from,
+                'to' => $to,
+            ],
+        ];
+    }
+
+    /**
      * @param array<string, mixed> $data
      * @return string last insert id
      */
@@ -223,12 +352,12 @@ final class QueryBuilder
             throw new QueryException('insert() requires at least one column.');
         }
 
-        $columns = array_map(fn (string $c) => Identifier::quote(Identifier::validate($c)), array_keys($data));
+        $columns = array_map(fn (string $c) => $this->grammar->quoteIdentifier($c), array_keys($data));
         $placeholders = implode(', ', array_fill(0, count($data), '?'));
 
         $sql = sprintf(
             'INSERT INTO %s (%s) VALUES (%s)',
-            Identifier::quote($this->table),
+            $this->grammar->quoteIdentifier($this->table),
             implode(', ', $columns),
             $placeholders
         );
@@ -257,13 +386,13 @@ final class QueryBuilder
         $sets = [];
         $bindings = [];
         foreach ($data as $column => $value) {
-            $sets[] = Identifier::quote(Identifier::validate($column)) . ' = ?';
+            $sets[] = $this->grammar->quoteIdentifier($column) . ' = ?';
             $bindings[] = $value;
         }
 
         $sql = sprintf(
             'UPDATE %s SET %s WHERE %s',
-            Identifier::quote($this->table),
+            $this->grammar->quoteIdentifier($this->table),
             implode(', ', $sets),
             implode(' AND ', $this->wheres)
         );
@@ -285,7 +414,7 @@ final class QueryBuilder
 
         $sql = sprintf(
             'DELETE FROM %s WHERE %s',
-            Identifier::quote($this->table),
+            $this->grammar->quoteIdentifier($this->table),
             implode(' AND ', $this->wheres)
         );
 
@@ -298,13 +427,20 @@ final class QueryBuilder
     /**
      * @return array{0: string, 1: list<mixed>}
      */
-    private function buildSelect(bool $countOnly = false): array
+    private function buildSelect(bool $countOnly = false, ?string $countByColumn = null): array
     {
-        $columns = $countOnly ? 'COUNT(*)' : implode(', ', $this->selectColumns);
-        $sql = sprintf('SELECT %s FROM %s', $columns, Identifier::quote($this->table));
+        if ($countByColumn !== null) {
+            // countBy(): the column is caller input, so it takes the same
+            // qualifyColumn() path (Identifier::validate + grammar quoting)
+            // as every other column reference in this builder.
+            $columns = $this->qualifyColumn($countByColumn) . ', COUNT(*)';
+        } else {
+            $columns = $countOnly ? 'COUNT(*)' : implode(', ', $this->selectColumns);
+        }
+        $sql = sprintf('SELECT %s FROM %s', $columns, $this->grammar->quoteIdentifier($this->table));
 
         foreach ($this->joins as $join) {
-            $sql .= sprintf(' %s JOIN %s ON %s', $join['type'], Identifier::quote($join['table']), $join['on']);
+            $sql .= sprintf(' %s JOIN %s ON %s', $join['type'], $this->grammar->quoteIdentifier($join['table']), $join['on']);
         }
 
         $allBindings = $this->bindings;
@@ -313,8 +449,10 @@ final class QueryBuilder
             $sql .= ' WHERE ' . implode(' AND ', $this->wheres);
         }
 
-        if (!$countOnly && $this->groupByColumn !== null) {
-            $sql .= ' GROUP BY ' . Identifier::quote($this->groupByColumn);
+        if ($countByColumn !== null) {
+            $sql .= ' GROUP BY ' . $this->qualifyColumn($countByColumn);
+        } elseif (!$countOnly && $this->groupByColumn !== null) {
+            $sql .= ' GROUP BY ' . $this->grammar->quoteIdentifier($this->groupByColumn);
         }
 
         if (!$countOnly && $this->orderColumn !== null) {
